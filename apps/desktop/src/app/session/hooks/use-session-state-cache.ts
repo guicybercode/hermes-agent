@@ -25,6 +25,7 @@ import { $sessionStates, $sessionTiles, publishSessionState, releaseSessionTrans
 import type { ClientSessionState } from '../../types'
 import { SessionStateCache } from '../session-state-cache'
 
+import { projectPendingClarifyForView } from './use-session-actions/restore-pending-clarify'
 import {
   invalidatePersistedDisplayTranscriptAuthority,
   suppressTranscriptForView
@@ -281,7 +282,10 @@ export function useSessionStateCache({
         return
       }
 
-      const viewState = suppressTranscriptForView(state, transcriptViewGateByRuntimeIdRef.current.has(sessionId))
+      const viewState = projectPendingClarifyForView(
+        suppressTranscriptForView(state, transcriptViewGateByRuntimeIdRef.current.has(sessionId)),
+        sessionId
+      )
 
       syncRuntimeMetadataToView(viewState)
       pendingViewStateRef.current = { sessionId, state: viewState }

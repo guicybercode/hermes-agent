@@ -1,4 +1,5 @@
 import type { GatewayEventPayload } from '@/lib/chat-messages'
+import { restorePendingClarifyToolCall } from '@/lib/chat-messages'
 import {
   $clarifyRequests,
   type ClarifyRequest,
@@ -8,6 +9,8 @@ import {
   setClarifyRequest
 } from '@/store/clarify'
 import type { SessionResumeResponse } from '@/types/hermes'
+
+import type { ClientSessionState } from '../../../types'
 
 export interface PendingClarifyResumeState {
   authoritativeAbsent: boolean
@@ -102,4 +105,37 @@ export function pendingClarifyToolPayload(request: ClarifyRequest): GatewayEvent
         },
     tool_id: request.requestId
   }
+}
+
+/** Live input remains answerable while an unverified transcript is held back.
+ * Keep this projection in the view: durable hydration owns the cache's rows. */
+export function projectPendingClarifyForView(state: ClientSessionState, sessionId: string): ClientSessionState {
+  const request = $clarifyRequests.get()[sessionId]
+
+  if (!request || !state.needsInput) {
+    return state
+  }
+
+  const projection = restorePendingClarifyToolCall(
+    state.messages,
+    pendingClarifyToolPayload(request),
+    request.receivedAt
+  )
+
+  if (projection.messages === state.messages) {
+    return state
+  }
+
+  // Repeated metadata updates must keep the synthetic row mounted while the
+  // persisted transcript is unresolved, preserving focus and drafted answers.
+  const messages =
+    projection.messages.length > state.messages.length
+      ? projection.messages.map(message =>
+          message.id === projection.streamId
+            ? { ...message, id: `clarify-request-${request.requestId}`, timestamp: request.receivedAt }
+            : message
+        )
+      : projection.messages
+
+  return { ...state, messages }
 }

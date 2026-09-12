@@ -69,12 +69,14 @@ import { $removedSessionIds, $sessionMutationsInFlight } from '@/store/session-r
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
+import type { RpcEvent } from '@/types/hermes'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
 import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
+import { renderMessageStream } from './use-message-stream/test-harness'
 import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
@@ -1020,9 +1022,14 @@ function ResumeHarness({
 }
 
 function ResumeTimerHarness({
+  onNavigationReady,
   onReady,
   requestGateway
 }: {
+  onNavigationReady?: (
+    actions: ReturnType<typeof useSessionActions>,
+    cache: ReturnType<typeof useSessionStateCache>
+  ) => void
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
@@ -1060,7 +1067,8 @@ function ResumeTimerHarness({
 
   useEffect(() => {
     onReady(actions.resumeSession)
-  }, [actions.resumeSession, onReady])
+    onNavigationReady?.(actions, cache)
+  }, [actions, cache, onNavigationReady, onReady])
 
   return null
 }
@@ -2940,91 +2948,6 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm' })
   })
 
-  it('publishes an answerable pending clarify row before transcript hydration resolves (#108718)', async () => {
-    // A proven warm cache (matching provenance) is what makes the view sync
-    // paint the live state directly instead of holding it behind the
-    // unproven-cache suppression — the realistic "switch back to a session
-    // you were just on" shape the report describes.
-    setSessions([storedSession({ id: 'stored-A', message_count: 1 })])
-
-    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
-      current: new Map([['stored-A', 'rt-A']])
-    }
-
-    const state = clientState('stored-A')
-    state.messages = [{ id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] }]
-    state.transcriptProvenance = {
-      connectionId: '',
-      coverage: 'latest-page',
-      lineageRootId: null,
-      profile: 'default',
-      source: 'persisted-display',
-      storedSessionId: 'stored-A'
-    }
-
-    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
-      current: new Map([['rt-A', state]])
-    }
-
-    const persistedTranscript = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
-    vi.mocked(getLatestSessionMessages).mockReturnValue(persistedTranscript.promise)
-
-    const requestGateway = vi.fn(async (method: string) => {
-      if (method === 'session.activate') {
-        return {
-          info: {},
-          message_count: 1,
-          messages: [],
-          messages_omitted: true,
-          pending_clarify: {
-            choices: ['safe', 'fast'],
-            question: 'Which path?',
-            request_id: 'req-navigation'
-          },
-          resumed: 'stored-A',
-          running: true,
-          session_id: 'rt-A',
-          session_key: 'stored-A'
-        } as never
-      }
-
-      return {} as never
-    })
-
-    const viewSyncs: ClientSessionState[] = []
-
-    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
-    render(
-      <ResumeHarness
-        onReady={ready => (resume = ready)}
-        onViewSync={(_sessionId, syncedState) => viewSyncs.push(syncedState)}
-        requestGateway={requestGateway}
-        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
-        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
-      />
-    )
-    await waitFor(() => expect(resume).not.toBeNull())
-
-    const resumePromise = resume!('stored-A', true)
-
-    // The REST transcript promise never resolves in this assertion window, so
-    // any answerable row seen here was published before hydration settled.
-    await waitFor(() => expect(viewSyncs.some(syncedState => syncedState.needsInput)).toBe(true))
-
-    const preHydrationState = viewSyncs.find(syncedState => syncedState.needsInput)
-
-    const answerableBeforeRest =
-      preHydrationState?.messages.filter(
-        message =>
-          message.pending && message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify')
-      ) ?? []
-
-    expect(answerableBeforeRest).toHaveLength(1)
-
-    persistedTranscript.resolve({ messages: [], session_id: 'stored-A' } as never)
-    await resumePromise
-  })
-
   it.each([
     ['with a stale request-store entry', true],
     ['after the request store was already cleared', false]
@@ -4615,4 +4538,245 @@ describe('routed fresh chat keeps its exact owner across turns', () => {
     expect(ambientRequest).not.toHaveBeenCalledWith('session.close', expect.anything())
     expect(getSessionOwnerHint(STORED)).toEqual(route)
   })
+})
+
+describe('pending clarify before transcript hydration with the real view cache', () => {
+  afterEach(() => {
+    cleanup()
+    clearClarifyRequest()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setMessages([])
+    setSessions([])
+    setBusy(false)
+    setAwaitingResponse(false)
+    vi.mocked(getLatestSessionMessages).mockReset()
+  })
+
+  async function hydratePendingClarify(
+    proven: boolean,
+    whilePending: (cache: ReturnType<typeof useSessionStateCache>, runtimeId: string, requestId: string) => void,
+    persistedCall = true,
+    batch = true
+  ) {
+    const runtimeId = 'rt-clarify-hydration'
+    const storedId = 'stored-clarify-hydration'
+    const requestId = 'req-clarify-hydration'
+    const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
+    setActiveSessionId('rt-other')
+    setSelectedStoredSessionId('stored-other')
+    setSessions([storedSession({ id: storedId, message_count: 1 })])
+
+    const response: SessionResumeResponse = {
+      session_id: runtimeId,
+      session_key: storedId,
+      resumed: storedId,
+      running: true,
+      messages: [],
+      messages_omitted: true,
+      message_count: 1,
+      info: {},
+      pending_clarify: {
+        request_id: requestId,
+        ...(batch
+          ? { questions: [{ qid: 'q0', question: 'Choose a path', choices: ['Safe', 'Fast'], multi_select: false }] }
+          : { question: 'Choose a path', choices: ['Safe', 'Fast'] }),
+        answers: {}
+      }
+    }
+
+    const requestGateway = vi.fn().mockResolvedValue(response)
+
+    const ready = deferred<{
+      actions: ReturnType<typeof useSessionActions>
+      cache: ReturnType<typeof useSessionStateCache>
+    }>()
+
+    render(
+      <ResumeTimerHarness
+        onNavigationReady={(actions, cache) => ready.resolve({ actions, cache })}
+        onReady={() => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+    const { actions, cache } = await ready.promise
+    const state = createClientSessionState(storedId)
+    state.busy = true
+    state.turnLive = true
+    state.messages = [{ id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'Synthetic prompt' }] }]
+
+    if (proven) {
+      state.transcriptProvenance = {
+        connectionId: '',
+        coverage: 'latest-page',
+        lineageRootId: null,
+        profile: 'default',
+        source: 'persisted-display',
+        storedSessionId: storedId
+      }
+    }
+
+    cache.runtimeIdByStoredSessionIdRef.current.set(storedId, runtimeId)
+    cache.sessionStateByRuntimeIdRef.current.set(runtimeId, state)
+    const navigation = actions.resumeSession(storedId, true)
+
+    const answerableRows = () =>
+      $messages
+        .get()
+        .filter(
+          message =>
+            message.pending &&
+            message.parts.some(
+              part => part.type === 'tool-call' && part.toolName === 'clarify' && part.result === undefined
+            )
+        )
+
+    try {
+      await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(1))
+      expect(requestGateway).toHaveBeenCalledWith(
+        'session.activate',
+        expect.objectContaining({ session_id: runtimeId })
+      )
+      expect($clarifyRequests.get()[runtimeId]?.requestId).toBe(requestId)
+      expect(answerableRows()).toHaveLength(1)
+      whilePending(cache, runtimeId, requestId)
+    } finally {
+      await act(async () => {
+        const transcript: Awaited<ReturnType<typeof getLatestSessionMessages>> = {
+          session_id: storedId,
+          messages: [
+            { role: 'user', content: 'Synthetic prompt', timestamp: 1 },
+            {
+              role: 'assistant',
+              content: '',
+              timestamp: 2,
+              tool_calls: [
+                {
+                  id: 'provider-call',
+                  type: 'function',
+                  function: {
+                    name: 'clarify',
+                    arguments: JSON.stringify(
+                      batch
+                        ? { questions: [{ question: 'Choose a path', choices: ['Safe', 'Fast'] }] }
+                        : { question: 'Choose a path', choices: ['Safe', 'Fast'] }
+                    )
+                  }
+                }
+              ]
+            }
+          ]
+        }
+
+        if (!persistedCall) {
+          transcript.messages = transcript.messages.filter(message => message.role !== 'assistant')
+        }
+
+        persisted.resolve(transcript)
+        await navigation
+      })
+    }
+
+    return { cache, runtimeId, answerableRows }
+  }
+
+  it.each([
+    { proven: false, batch: false },
+    { proven: false, batch: true },
+    { proven: true, batch: false },
+    { proven: true, batch: true }
+  ])('keeps a batch $batch question answerable with transcript provenance $proven', async ({ proven, batch }) => {
+    const { answerableRows } = await hydratePendingClarify(
+      proven,
+      (cache, runtimeId) => {
+        const beforeHeartbeat = $messages.get()
+        expect(beforeHeartbeat.some(message => message.role === 'user')).toBe(proven)
+        act(() => cache.updateSessionState(runtimeId, state => ({ ...state, provider: 'heartbeat-provider' })))
+        expect($messages.get()).toBe(beforeHeartbeat)
+        expect(cache.sessionStateByRuntimeIdRef.current.get(runtimeId)?.messages).toHaveLength(1)
+      },
+      true,
+      batch
+    )
+
+    expect(answerableRows()).toHaveLength(1)
+    expect(answerableRows()[0].parts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'tool-call', toolCallId: 'provider-call' })])
+    )
+  })
+
+  it.each([
+    { transition: 'answer', persistedCall: true },
+    { transition: 'expire', persistedCall: true },
+    { transition: 'replace', persistedCall: true },
+    { transition: 'replace', persistedCall: false },
+    { transition: 'replace', persistedCall: true, sameQuestion: true },
+    { transition: 'replace', persistedCall: false, sameQuestion: true },
+    { transition: 'complete', persistedCall: true }
+  ])(
+    'honors a request $transition during hydration with persisted call $persistedCall and repeated question $sameQuestion',
+    async ({ transition, persistedCall, sameQuestion = false }) => {
+      const { runtimeId, answerableRows } = await hydratePendingClarify(
+        true,
+        (cache, runtimeId, requestId) => {
+          const stream = renderMessageStream(runtimeId, {
+            states: cache.sessionStateByRuntimeIdRef.current,
+            updateSessionState: cache.updateSessionState
+          })
+
+          act(() => {
+            if (transition === 'answer') {
+              // The card clears the request after clarify.respond succeeds.
+              clearClarifyRequest(requestId, runtimeId)
+            } else {
+              const events: Record<string, RpcEvent> = {
+                expire: { type: 'clarify.expire', session_id: runtimeId, payload: { request_id: requestId } },
+                replace: {
+                  type: 'clarify.request',
+                  session_id: runtimeId,
+                  payload: {
+                    request_id: 'new-request',
+                    question: sameQuestion ? 'Choose a path' : 'Which branch?',
+                    choices: sameQuestion ? ['Safe', 'Fast'] : ['Main', 'Dev']
+                  }
+                },
+                complete: {
+                  type: 'tool.complete',
+                  session_id: runtimeId,
+                  payload: {
+                    tool_id: 'provider-call',
+                    name: 'clarify',
+                    result: { responses: [{ question: 'Choose a path', user_response: 'Safe' }] }
+                  }
+                }
+              }
+
+              stream.handleEvent(events[transition])
+            }
+          })
+        },
+        persistedCall
+      )
+
+      await waitFor(() => expect(answerableRows()).toHaveLength(transition === 'replace' ? 1 : 0))
+
+      if (transition === 'replace') {
+        expect($clarifyRequests.get()[runtimeId]?.requestId).toBe('new-request')
+        expect(
+          $messages
+            .get()
+            .flatMap(message => message.parts)
+            .filter(part => part.type === 'tool-call' && part.toolCallId === 'new-request')
+        ).toHaveLength(1)
+        expect(answerableRows()[0].parts).toEqual(
+          expect.arrayContaining([expect.objectContaining({ type: 'tool-call', toolCallId: 'new-request' })])
+        )
+      } else if (transition === 'complete') {
+        expect($clarifyRequests.get()[runtimeId]).toBeDefined()
+      } else {
+        expect($clarifyRequests.get()[runtimeId]).toBeUndefined()
+      }
+    }
+  )
 })

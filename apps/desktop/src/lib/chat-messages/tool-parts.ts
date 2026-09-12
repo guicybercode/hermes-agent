@@ -361,11 +361,13 @@ interface PendingClarifyLocation {
 
 function findPendingClarifyLocation(
   messages: ChatMessage[],
-  payload: GatewayEventPayload
+  payload: GatewayEventPayload,
+  preserveToolId?: string
 ): PendingClarifyLocation | null {
   const stableId = toolId(payload)
   const matchValues = toolPayloadMatchValues(payload)
   let solePending: PendingClarifyLocation | null = null
+  let solePendingHasNoArgs = false
   let pendingCount = 0
 
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
@@ -374,15 +376,22 @@ function findPendingClarifyLocation(
     for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
       const part = message.parts[partIndex]
 
-      if (part.type !== 'tool-call' || part.toolName !== 'clarify' || part.result !== undefined) {
+      if (
+        part.type !== 'tool-call' ||
+        part.toolName !== 'clarify' ||
+        part.result !== undefined ||
+        part.toolCallId === preserveToolId
+      ) {
         continue
       }
 
       pendingCount += 1
       solePending = { messageIndex, partIndex }
+      const partMatchValues = toolPartMatchValues(part)
+      solePendingHasNoArgs = partMatchValues.length === 0
 
       const exactId = Boolean(stableId && part.toolCallId === stableId)
-      const contextual = hasToolMatchOverlap(matchValues, toolPartMatchValues(part))
+      const contextual = hasToolMatchOverlap(matchValues, partMatchValues)
 
       if (exactId || contextual) {
         return { messageIndex, partIndex }
@@ -392,8 +401,9 @@ function findPendingClarifyLocation(
 
   // Older/sparse projections can lose the identifying args. One session can
   // only block on one clarify at a time, so a sole open clarify is still the
-  // authoritative row even without a usable correlation value.
-  return pendingCount === 1 ? solePending : null
+  // authoritative row without a usable correlation value. Two identifiable
+  // but different questions cannot be the same request.
+  return pendingCount === 1 && (!matchValues.length || solePendingHasNoArgs) ? solePending : null
 }
 
 function skippedClarifyResult(part: Extract<ChatMessagePart, { type: 'tool-call' }>): Record<string, unknown> {
@@ -418,15 +428,18 @@ function skippedClarifyResult(part: Extract<ChatMessagePart, { type: 'tool-call'
 
 /** Mark one pending clarify as timed out/settled without ending a later phase
  * of the same assistant turn. `keepMessageRunning` keeps the containing message
- * open for subsequent deltas while the clarify part itself becomes settled. */
+ * open for subsequent deltas while the clarify part itself becomes settled.
+ * Preserve a newer request's tool id when retiring an older resume snapshot;
+ * two successive requests can legitimately repeat the same question. */
 export function settlePendingClarifyToolCall(
   messages: ChatMessage[],
   payload: GatewayEventPayload,
   keepMessageRunning: boolean,
-  occurredAt = Date.now() / 1000
+  occurredAt = Date.now() / 1000,
+  preserveToolId?: string
 ): SettledClarifyProjection {
   const clarifyPayload = { ...payload, name: 'clarify' }
-  const location = findPendingClarifyLocation(messages, clarifyPayload)
+  const location = findPendingClarifyLocation(messages, clarifyPayload, preserveToolId)
 
   if (!location) {
     return { messages, streamId: null }

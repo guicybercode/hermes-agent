@@ -139,7 +139,11 @@ import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
 
 import { sessionCreateOverrideParams, type SessionCreateOverrides, type SessionSeedMessage } from './create-overrides'
-import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
+import {
+  pendingClarifyToolPayload,
+  projectPendingClarifyForView,
+  restorePendingClarifyFromSnapshot
+} from './restore-pending-clarify'
 import {
   createPersistedDisplayTranscriptProvenance,
   hasPersistedDisplayTranscriptProvenance,
@@ -1292,25 +1296,11 @@ export function useSessionActions({
               setBusy(running)
               setAwaitingResponse(running && !pendingClarify)
 
-              // View-only: project the pending clarify onto the pre-hydration
-              // transcript for this publish so `needsInput: true` is never
-              // shown ahead of an answerable row (#108718). The cache entry
-              // above stays unprojected — hydration below re-derives the
-              // authoritative transcript from scratch, and folding this
-              // synthetic row into that pipeline would leave a duplicate
-              // once the persisted transcript carries the same call under a
-              // different message id.
-              const earlyClarifyProjection = pendingClarify
-                ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
-                : null
-
               syncSessionStateToView(
                 cachedRuntimeId,
-                suppressTranscriptForView(
-                  earlyClarifyProjection
-                    ? { ...activatedLivenessState, messages: earlyClarifyProjection.messages }
-                    : activatedLivenessState,
-                  suppressUnprovenWarmTranscript
+                projectPendingClarifyForView(
+                  suppressTranscriptForView(activatedLivenessState, suppressUnprovenWarmTranscript),
+                  cachedRuntimeId
                 )
               )
 
@@ -1394,15 +1384,32 @@ export function useSessionActions({
                 )
               }
 
-              const pendingClarifyProjection = pendingClarify
-                ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
-                : null
+              // The user can answer, or the transport can replace/expire the
+              // request, while REST is pending. Reconcile with live truth.
+              const currentClarify = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.needsInput
+                ? $clarifyRequests.get()[cachedRuntimeId]
+                : undefined
 
-              const clearedClarifyProjection = clarifyAuthoritativelyAbsent
-                ? settlePendingClarifyToolCall(
-                    activatedMessages,
-                    pendingClarifyState.cleared ? pendingClarifyToolPayload(pendingClarifyState.cleared) : {},
-                    running
+              const withdrawnClarify =
+                pendingClarify && pendingClarify.requestId !== currentClarify?.requestId
+                  ? pendingClarify
+                  : pendingClarifyState.cleared
+
+              const clearedClarifyProjection =
+                withdrawnClarify || (clarifyAuthoritativelyAbsent && !currentClarify)
+                  ? settlePendingClarifyToolCall(
+                      activatedMessages,
+                      withdrawnClarify ? pendingClarifyToolPayload(withdrawnClarify) : {},
+                      sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.busy ?? running,
+                      undefined,
+                      currentClarify?.requestId
+                    )
+                  : null
+
+              const pendingClarifyProjection = currentClarify
+                ? restorePendingClarifyToolCall(
+                    clearedClarifyProjection?.messages ?? activatedMessages,
+                    pendingClarifyToolPayload(currentClarify)
                   )
                 : null
 
