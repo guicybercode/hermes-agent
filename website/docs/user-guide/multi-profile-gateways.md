@@ -340,6 +340,9 @@ profile and never shares with the default or any sibling:
 | Session namespace | `agent:<profile>:…` (default keeps `agent:main:…`) | Two profiles on the same chat never share history |
 | Logs | `agent.log` / `errors.log` / `gateway.log` under the profile's own home | — |
 | Terminal sandbox settings (`terminal.*`, SSH targets) | The profile's `config.yaml` | Documented default; unparsable config → execution refused |
+| Cron `.env` tuning (`HERMES_CRON_TIMEOUT`, `HERMES_MODEL` fallback, `HERMES_CRON_MAX_PARALLEL`, prefill file), worker / Bot Chat child env | The profile's own `.env`; children never inherit the default profile's `.env` settings or bridged `TERMINAL_*` policy | Cron defaults / model refusal, exactly as a standalone `hermes -p <name> gateway run` |
+| Kanban workers and notifications for a profile's tasks | The assignee's `.env` + `config.yaml` (toolset pin, terminal backend, media policy, display language) | — |
+| `/loop` ticks, `background_process_notifications` gate, `notice_delivery`, background-process checkpoint recovery | The owning profile's `state.db` / `config.yaml` / `processes.json` | — |
 
 What is **shared** by design: the process, its PID/lock and `gateway_state.json`
 (default home), the one HTTP listener, and the `profile_routes` table (declared
