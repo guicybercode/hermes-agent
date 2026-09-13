@@ -52,6 +52,21 @@ jobs:
           test -x .venv/Scripts/python.exe
           .venv/Scripts/python.exe -c 'import sys, pytest, win32file; assert sys.platform == "win32"; print(sys.version); print(sys.executable)'
 
+      - name: Create temporary local SMB share for UNC coverage
+        id: unc-share
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shareName = "hermes_dist_$($env:GITHUB_RUN_ID)_$($env:GITHUB_RUN_ATTEMPT)"
+          $sharePath = Join-Path $env:RUNNER_TEMP $shareName
+          New-Item -ItemType Directory -Path $sharePath | Out-Null
+          $account = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          "HERMES_TEST_UNC_SHARE=$shareName" >> $env:GITHUB_ENV
+          New-SmbShare -Name $shareName -Path $sharePath -FullAccess $account -Temporary | Out-Null
+          $uncPath = "\\localhost\$shareName"
+          if (-not (Test-Path -LiteralPath $uncPath)) { throw 'Temporary UNC share is not reachable' }
+          "HERMES_TEST_UNC_ROOT=$uncPath" >> $env:GITHUB_ENV
+
       - name: Run profile distribution regression suites
         shell: bash
         run: |
@@ -62,3 +77,25 @@ jobs:
             tests/hermes_cli/test_profiles.py \
             tests/hermes_cli/test_profile_install_env_encoding.py \
             -j 2 --file-retries 0 --tb=short
+
+      - name: Run distribution tests through native UNC paths
+        if: ${{ !cancelled() && steps.unc-share.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh tests/hermes_cli/test_profile_main_namespace.py \
+            -k 'windows_unc or windows_extended_unc' \
+            --basetemp "${HERMES_TEST_UNC_ROOT}\\pytest-native" \
+            -j 1 --file-retries 0 --tb=short
+
+      - name: Remove temporary SMB share
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:HERMES_TEST_UNC_SHARE) {
+            $share = Get-SmbShare -Name $env:HERMES_TEST_UNC_SHARE -ErrorAction SilentlyContinue
+            if ($share) { Remove-SmbShare -Name $share.Name -Force }
+            $sharePath = Join-Path $env:RUNNER_TEMP $env:HERMES_TEST_UNC_SHARE
+            if (Test-Path -LiteralPath $sharePath) { Remove-Item -LiteralPath $sharePath -Recurse -Force }
+          }
