@@ -2,6 +2,7 @@
 
 import tarfile
 import shutil
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,6 +41,7 @@ def profile_home(tmp_path, monkeypatch):
 @pytest.mark.parametrize("operation", [
     "create", "import", "rename", "distribution", "distribution_tombstone", "distribution_symlink",
     "stage_inside_source", "stage_inside_target",
+    "stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission",
 ])
 @pytest.mark.parametrize("name", ["main", "MAIN", " main "])
 def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_path, monkeypatch, operation, name):
@@ -52,6 +54,52 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
         bundle.add(source, arcname="source")
     write_manifest(source, DistributionManifest(name="source"))
     target = profile_home / "profiles" / "main"
+    if operation in {"stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission"}:
+        (source / "SOUL.md").write_text("Planned source content")
+        (source / "skills").mkdir()
+        (source / "skills" / "guide.md").write_text("Planned skill content")
+        target.mkdir()
+        (target / "config.yaml").write_text(config)
+        workdir = tmp_path / "staging"
+        external = tmp_path / "external"
+        root_stat = source.stat()
+        scanned = False
+        real_scandir = os.scandir
+
+        @contextmanager
+        def mutate_after_enumeration(path):
+            nonlocal scanned
+            info = os.fstat(path) if isinstance(path, int) else Path(path).stat()
+            is_source = (info.st_dev, info.st_ino) == (root_stat.st_dev, root_stat.st_ino)
+            with real_scandir(path) as entries:
+                yield entries
+            if not is_source or scanned:
+                return
+            scanned = True
+            if operation == "stage_permission":
+                raise PermissionError("source permission changed during staging")
+            if operation == "stage_disappears":
+                (source / "SOUL.md").unlink()
+                return
+            if operation == "stage_dir_link":
+                shutil.rmtree(source / "skills")
+                external.mkdir()
+                (external / "guide.md").write_text("External private content")
+                (source / "skills").symlink_to(external, target_is_directory=True)
+            else:
+                (source / "SOUL.md").unlink()
+                external.write_text("External private content")
+                (source / "SOUL.md").symlink_to(external)
+
+        monkeypatch.setattr(os, "scandir", mutate_after_enumeration)
+        with pytest.raises(DistributionError):
+            distributions.plan_install(str(source), workdir, override_name=name)
+        assert scanned
+        assert not (workdir / "local").exists()
+        assert (target / "config.yaml").read_text() == config
+        assert not (target / "SOUL.md").exists()
+        return
+
     if operation in {"stage_inside_source", "stage_inside_target"}:
         parent = source if operation == "stage_inside_source" else target / "skills"
         workdir = parent / "tmp"
@@ -74,6 +122,7 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
         else:
             assert (target / "config.yaml").read_text() == config
             assert (parent / "guide.md").read_text() == "Existing skill content"
+            assert not list(workdir.iterdir())
         return
 
     if operation == "distribution_symlink":
