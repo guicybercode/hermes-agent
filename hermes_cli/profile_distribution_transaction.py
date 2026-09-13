@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import ExitStack
-import errno
+from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
@@ -13,6 +13,14 @@ import stat
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CreatedDirectory:
+    parent: object
+    name: str
+    identity: tuple[int, int] | None = None
+    anchor: object | None = None
 
 
 def _checked_paths(paths: Sequence[tuple[str, ...]]) -> tuple[tuple[str, ...], ...]:
@@ -41,14 +49,24 @@ def _descend(parent, parts):
     return parent
 
 
+def _create_directory(parent, name, created, mode=0o777):
+    parent.mkdir(name, mode=mode)
+    # Even stat/pin acquisition can fail after mkdir succeeds. Keep the location
+    # first; an unknown or replaced identity must be reported, never removed.
+    record = _CreatedDirectory(parent, name)
+    created.append(record)
+    info = parent.stat(name)
+    record.identity = info.st_dev, info.st_ino
+    child = parent.child(name)
+    record.anchor = child
+    if child.identity != record.identity:
+        raise OSError(f"Created distribution directory changed before opening: {parent.path / name}")
+    return child
+
+
 def _ensure_child(parent, name, created):
     parent.verify()
-    if not _exists(parent, name):
-        parent.mkdir(name)
-        child = parent.child(name)
-        created.append((parent, name, child))
-    else:
-        child = parent.child(name)
+    child = parent.child(name) if _exists(parent, name) else _create_directory(parent, name, created)
     child.verify()
     return child
 
@@ -70,6 +88,26 @@ def _replace(source, name, destination):
 def _remove_backup(parent, name, backup):
     backup.close()
     parent.remove_tree(name)
+
+
+def _undo_created(record, failures):
+    path = record.parent.path / record.name
+    try:
+        if record.anchor is not None:
+            record.anchor.close()
+        current = record.parent.stat(record.name)
+        if (
+            record.identity is None or record.identity != (current.st_dev, current.st_ino)
+            or not stat.S_ISDIR(current.st_mode)
+            or getattr(current, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            failures.append(f"Created directory identity could not be verified; left {path} untouched")
+            return
+        record.parent.rmdir(record.name)
+    except FileNotFoundError:
+        return
+    except OSError as cleanup_error:
+        failures.append(f"Created directory retained at {path}: {cleanup_error}")
 
 
 def commit_owned_payload(
@@ -110,13 +148,15 @@ def commit_owned_payload(
         # A separate private sibling survives the caller's scratch cleanup if a
         # restoration fails. Create it through the pinned parent too.
         backup_name = ".hermes-dist-rollback-" + secrets.token_hex(16)
-        parent.verify()
-        parent.mkdir(backup_name, mode=0o700)
-        backup = parent.child(backup_name)
+        backup_path = parent.path / backup_name
+        backup = None
+        backup_created = []
         created = []
         journal = []
         try:
             parent.verify()
+            backup = _create_directory(parent, backup_name, backup_created, mode=0o700)
+            backup.verify()
             destination_root = _ensure_child(parent, target.name, created)
             if destination_root.identity[0] != prepared.identity[0]:
                 raise OSError("Distribution publication requires the profile filesystem")
@@ -151,27 +191,19 @@ def commit_owned_payload(
                             saved.replace(name, destination, name)
                 except OSError as rollback_error:
                     failures.append(f"{destination.path / name}: {rollback_error}")
-            for directory_parent, name, directory in reversed(created):
-                try:
-                    current = directory_parent.stat(name)
-                    if directory.identity != (current.st_dev, current.st_ino):
-                        continue
-                    # Windows denies removal while the directory's own handle is open.
-                    directory.close()
-                    directory_parent.rmdir(name)
-                except FileNotFoundError:
-                    continue
-                except OSError as rollback_error:
-                    if rollback_error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-                        failures.append(f"{directory.path}: {rollback_error}")
-            if not failures:
+            for record in reversed(created):
+                _undo_created(record, failures)
+            if backup is None:
+                for record in reversed(backup_created):
+                    _undo_created(record, failures)
+            elif not failures:
                 try:
                     _remove_backup(parent, backup_name, backup)
                 except OSError as cleanup_error:
                     failures.append(f"backup cleanup: {cleanup_error}")
             if failures:
                 message = (
-                    f"Distribution rollback could not finish; recovery files retained at {backup.path}: "
+                    f"Distribution rollback could not finish; recovery files retained at {backup_path}: "
                     + "; ".join(failures)
                 )
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -183,4 +215,4 @@ def commit_owned_payload(
             try:
                 _remove_backup(parent, backup_name, backup)
             except OSError:
-                logger.warning("Distribution committed; could not remove backups at %s", backup.path, exc_info=True)
+                logger.warning("Distribution committed; could not remove backups at %s", backup_path, exc_info=True)

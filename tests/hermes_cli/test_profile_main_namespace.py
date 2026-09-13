@@ -516,6 +516,42 @@ def _assert_destination_parent_binding(source, target, tmp_path, monkeypatch, fi
     assert set(target.parent.iterdir()) == parent_entries
 
 
+def _fail_created_directory_open(target, monkeypatch, change):
+    from hermes_cli.profile_distribution_destination import open_directory
+
+    anchor = open_directory(target.parent)
+    try:
+        anchor_type = type(anchor)
+    finally:
+        anchor.close()
+    real_mkdir, real_child = anchor_type.mkdir, anchor_type.child
+    pending, failed = {}, []
+
+    def record_creation(parent, name, *args, **kwargs):
+        result = real_mkdir(parent, name, *args, **kwargs)
+        selected = {
+            "transaction_open_destination": parent.path == target and name == "new",
+            "transaction_open_backup": parent.path == target.parent and name.startswith(".hermes-dist-rollback-"),
+        }[change]
+        if selected:
+            info = parent.stat(name)
+            pending[(id(parent), name)] = info.st_dev, info.st_ino
+        return result
+
+    def fail_open_once(parent, name):
+        identity = pending.get((id(parent), name))
+        if identity is not None and not failed:
+            current = parent.stat(name)
+            assert (current.st_dev, current.st_ino) == identity
+            failed.append(parent.path / name)
+            raise OSError("injected failure opening the directory just created")
+        return real_child(parent, name)
+
+    monkeypatch.setattr(anchor_type, "mkdir", record_creation)
+    monkeypatch.setattr(anchor_type, "child", fail_open_once)
+    return failed
+
+
 def _assert_publication_transaction(source, target, monkeypatch, finish, change):
     (target / "later.md").write_text("Previously installed later entry")
     (target / "skills" / "empty").mkdir()
@@ -535,6 +571,8 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         "transaction_commit_second": [new_file, "skills", "SOUL.md", "later.md", manifest_name],
         "transaction_commit_manifest": [manifest_name, "SOUL.md", new_file, "skills", "later.md"],
         "transaction_commit_rollback_failure": ["SOUL.md", "skills", "later.md", new_file, manifest_name],
+        "transaction_open_destination": ["SOUL.md", new_file, "skills", "later.md", manifest_name],
+        "transaction_open_backup": ["SOUL.md", new_file, "skills", "later.md", manifest_name],
     }[change]
     write_manifest(source, DistributionManifest(
         name="main", source=str(source), version="2.0.0", distribution_owned=ordered,
@@ -582,6 +620,9 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
 
         monkeypatch.setattr(os, "replace", fail_next_publication)
 
+    failed_open = []
+    if change.startswith("transaction_open_"):
+        failed_open = _fail_created_directory_open(target, monkeypatch, change)
     with pytest.raises(DistributionError) as error:
         if finish == "install":
             install_distribution(str(source), name="main", force=True)
@@ -590,6 +631,8 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
     if change.startswith("transaction_commit_"):
         assert len(failed) == 1
         assert len(applied) >= fail_after
+    if change.startswith("transaction_open_"):
+        assert len(failed_open) == 1
     assert (target.stat().st_dev, target.stat().st_ino) == identity
     if change == "transaction_commit_rollback_failure":
         assert rollback_failed == [backups[target / "skills"]]
@@ -663,6 +706,7 @@ def _assert_staged_publication(target, tmp_path, monkeypatch, publish, change):
 
 @pytest.mark.parametrize("finish,change", [("rename", None), ("delete", None), ("retry_delete", None),
     ("install", "confirm_local"), ("install", "confirm_git"), ("install", "bootstrap_link"),
+    ("install", "transaction_open_destination"), ("install", "transaction_open_backup"),
 ] + [
     (operation, change)
     for operation in ("install", "update")
