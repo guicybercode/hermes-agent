@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           scripts/run_tests.sh tests/hermes_cli/test_profile_main_namespace.py \
             -k 'windows_unc or windows_extended_unc' \
-            --basetemp "${HERMES_TEST_UNC_ROOT}\\pytest-native" \
+            --basetemp="${HERMES_TEST_UNC_ROOT}\\pytest-native" \
             -j 1 --file-retries 0 --tb=short
 
       - name: Remove temporary SMB share
