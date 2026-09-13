@@ -67,6 +67,38 @@ jobs:
           if (-not (Test-Path -LiteralPath $uncPath)) { throw 'Temporary UNC share is not reachable' }
           "HERMES_TEST_UNC_ROOT=$uncPath" >> $env:GITHUB_ENV
 
+      - name: Record native path representations
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/Scripts/python.exe - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import win32api
+          import win32file
+
+          unc = os.environ['HERMES_TEST_UNC_ROOT']
+          for path in (os.environ['TEMP'], str(Path(unc).anchor), unc):
+              handle = win32file.CreateFile(
+                  path, win32file.GENERIC_READ, win32file.FILE_SHARE_READ, None,
+                  win32file.OPEN_EXISTING,
+                  win32file.FILE_FLAG_OPEN_REPARSE_POINT | win32file.FILE_FLAG_BACKUP_SEMANTICS, None,
+              )
+              try:
+                  info = os.lstat(path)
+                  native = win32file.GetFileInformationByHandle(handle)
+                  print(json.dumps({
+                      'input': path,
+                      'long': win32api.GetLongPathNameW(path),
+                      'actual': win32file.GetFinalPathNameByHandle(handle, 0),
+                      'stat_identity': [info.st_dev, info.st_ino],
+                      'handle_identity': [native[4], (native[8] << 32) | native[9]],
+                  }))
+              finally:
+                  win32file.CloseHandle(handle)
+          PY
+
       - name: Run profile distribution regression suites
         shell: bash
         run: |

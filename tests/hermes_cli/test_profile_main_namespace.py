@@ -345,6 +345,14 @@ def _assert_windows_source_contract(tmp_path, monkeypatch, change):
             raw = "\\\\?\\UNC\\" + raw[2:]
         elif change == "windows_extended_path":
             raw = "\\\\?\\" + raw
+        elif change == "windows_short_path":
+            import win32api
+
+            short_path = win32api.GetShortPathName(raw)
+            if os.path.normcase(short_path) == os.path.normcase(raw):
+                pytest.skip("The source volume must provide 8.3 aliases for native short-path coverage")
+            assert Path(short_path).samefile(exported)
+            raw = short_path
         elif change == "windows_unc":
             assert raw.startswith("\\\\")
         with open_source(Path(raw)) as captured:
@@ -418,7 +426,7 @@ def _observe_private_reads(private_file, monkeypatch):
 ] + [
     pytest.param("install", change, marks=pytest.mark.windows_only)
     for change in (
-        "windows_eof", "windows_extended_path", "windows_unc", "windows_extended_unc",
+        "windows_eof", "windows_extended_path", "windows_short_path", "windows_unc", "windows_extended_unc",
         "windows_junction", "windows_sharing", "windows_ancestry",
     )
 ])
