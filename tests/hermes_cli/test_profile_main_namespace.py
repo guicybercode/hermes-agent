@@ -427,6 +427,94 @@ def _profile_tree_contents(root):
     return contents
 
 
+def _replace_path(path, directory_fd, profiles_root):
+    path = Path(path)
+    if directory_fd is None or path.is_absolute():
+        return path
+    expected = os.fstat(directory_fd)
+    for parent in (profiles_root, *profiles_root.rglob("*")):
+        if parent.is_symlink() or not parent.is_dir():
+            continue
+        info = parent.stat()
+        if (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino):
+            return parent / path
+    pytest.fail("rename used a descriptor outside the real profile transaction directories")
+
+
+def _assert_destination_parent_binding(source, target, tmp_path, monkeypatch, finish, change):
+    nested = target / "nested"
+    nested.mkdir()
+    (nested / "previous.md").write_text("Original parent content")
+    (source / "nested").mkdir()
+    (source / "nested" / "new.md").write_text("New approved nested content")
+    (source / "SOUL.md").write_text("New approved first content")
+    ordered = ["nested/new.md", "SOUL.md"]
+    if change == "destination_parent_late":
+        ordered.reverse()
+    write_manifest(source, DistributionManifest(
+        name="main", source=str(source), version="2.0.0", distribution_owned=ordered,
+    ))
+    external = tmp_path / "private-parent"
+    external.mkdir()
+    (external / "private.md").write_text("Private content must remain untouched")
+    external_before = _profile_tree_contents(external)
+    target_before = _profile_tree_contents(target)
+    nested_before = _profile_tree_contents(nested)
+    parent_entries = set(target.parent.iterdir())
+    parent_identity = nested.stat().st_dev, nested.stat().st_ino
+    moved = tmp_path / "moved-parent"
+    attempted, swapped = [], []
+    real_replace = os.replace
+
+    def swap_parent_before_rename(src, dst, *args, **kwargs):
+        descriptor = kwargs.get("dst_dir_fd")
+        if descriptor is None:
+            is_nested_write = Path(dst) == nested / "new.md"
+        else:
+            info = os.fstat(descriptor)
+            is_nested_write = Path(dst) == Path("new.md") and (info.st_dev, info.st_ino) == parent_identity
+        if is_nested_write and not attempted:
+            attempted.append(True)
+            try:
+                nested.rename(moved)
+            except PermissionError:
+                assert not moved.exists()
+            else:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(nested), str(external)],
+                        check=True, capture_output=True,
+                    )
+                else:
+                    nested.symlink_to(external, target_is_directory=True)
+                swapped.append((nested.lstat().st_mode, nested.readlink() if nested.is_symlink() else None))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", swap_parent_before_rename)
+    error = None
+    try:
+        if finish == "install":
+            install_distribution(str(source), name="main", force=True)
+        else:
+            update_distribution("main")
+    except DistributionError as exc:
+        error = exc
+    assert attempted
+    assert _profile_tree_contents(external) == external_before
+    if swapped:
+        assert error is not None
+        expected = {path: value for path, value in target_before.items() if path.parts[0] != "nested"}
+        expected[Path("nested")] = swapped[0]
+        assert _profile_tree_contents(target) == expected
+        assert _profile_tree_contents(moved) == nested_before
+        assert (moved.stat().st_dev, moved.stat().st_ino) == parent_identity
+    else:
+        assert error is None
+        assert (nested / "new.md").read_bytes() == (source / "nested" / "new.md").read_bytes()
+        assert (target / "SOUL.md").read_bytes() == (source / "SOUL.md").read_bytes()
+    assert set(target.parent.iterdir()) == parent_entries
+
+
 def _assert_publication_transaction(source, target, monkeypatch, finish, change):
     (target / "later.md").write_text("Previously installed later entry")
     (target / "skills" / "empty").mkdir()
@@ -472,8 +560,8 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         destinations = {target.joinpath(*Path(relative).parts) for relative in ordered}
 
         def fail_next_publication(src, dst, *args, **kwargs):
-            origin = Path(src)
-            destination = Path(dst)
+            origin = _replace_path(src, kwargs.get("src_dir_fd"), target.parent)
+            destination = _replace_path(dst, kwargs.get("dst_dir_fd"), target.parent)
             publishes_owned_entry = destination in destinations
             if (
                 change == "transaction_commit_rollback_failure" and failed and not rollback_failed
@@ -535,6 +623,7 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         "transaction_late_second", "transaction_late_third",
         "transaction_commit_first", "transaction_commit_second", "transaction_commit_manifest",
         "transaction_commit_rollback_failure",
+        "destination_parent_first", "destination_parent_late",
     )
 ] + [
     pytest.param(operation, "directory_modes", marks=marker, id=f"{operation}-directory_modes-{host}")
@@ -601,6 +690,9 @@ def test_legacy_main_profile_remains_manageable(profile_home, tmp_path, monkeypa
         return
     if change is not None and change.startswith("transaction_"):
         _assert_publication_transaction(source, legacy, monkeypatch, finish, change)
+        return
+    if change is not None and change.startswith("destination_parent_"):
+        _assert_destination_parent_binding(source, legacy, tmp_path, monkeypatch, finish, change)
         return
 
     if change is not None:
