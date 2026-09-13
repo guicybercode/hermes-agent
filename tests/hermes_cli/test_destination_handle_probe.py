@@ -9,13 +9,14 @@ import pytest
 
 @pytest.mark.windows_only
 def test_directory_handle_modes_allow_child_moves_and_pin_the_parent(tmp_path):
+    import win32con
     import win32file
 
     rows = []
     modes = (
         ("read_read", win32file.GENERIC_READ, win32file.FILE_SHARE_READ),
         ("read_readwrite", win32file.GENERIC_READ, win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE),
-        ("attributes_readwrite", win32file.FILE_READ_ATTRIBUTES, win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE),
+        ("attributes_readwrite", win32con.FILE_READ_ATTRIBUTES, win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE),
         ("zero_readwrite", 0, win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE),
     )
     for label, access, sharing in modes:
