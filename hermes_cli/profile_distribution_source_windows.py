@@ -22,7 +22,7 @@ def _normal_path(value: str) -> str:
 def _checked_stat(path: Path):
     info = os.lstat(path)
     if info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-        raise OSError(f"Distribution source contains a reparse point: {path}")
+        raise OSError(f"Distribution source contains a symlink or reparse point: {path}")
     if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
         raise OSError(f"Distribution source is not a regular file or directory: {path}")
     return info
@@ -54,7 +54,7 @@ class _Source:
             raise OSError(f"Distribution source is not a disk file: {self._path}")
         info = win32file.GetFileInformationByHandle(self._handle)
         if info[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            raise OSError(f"Distribution source became a reparse point: {self._path}")
+            raise OSError(f"Distribution source became a symlink or reparse point: {self._path}")
         identity = info[4], (info[8] << 32) | info[9]
         if identity != (self._expected.st_dev, self._expected.st_ino):
             raise OSError(f"Distribution source identity changed: {self._path}")
