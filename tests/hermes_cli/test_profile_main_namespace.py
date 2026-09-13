@@ -458,6 +458,7 @@ def _assert_destination_parent_binding(source, target, tmp_path, monkeypatch, fi
     external.mkdir()
     (external / "private.md").write_text("Private content must remain untouched")
     external_before = _profile_tree_contents(external)
+    (target / "SOUL.md").chmod(0o444)
     target_before = _profile_tree_contents(target)
     nested_before = _profile_tree_contents(nested)
     parent_entries = set(target.parent.iterdir())
@@ -610,6 +611,56 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
     assert stages and all(not staged.exists() for staged in stages)
 
 
+def _assert_staged_publication(target, tmp_path, monkeypatch, publish, change):
+    planned, release = Event(), Event()
+    plans = []
+    private_reads = []
+    revalidate = distributions._revalidate_plan
+
+    def pause_after_revalidation(plan):
+        revalidate(plan)
+        plans.append(plan)
+        planned.set()
+        assert release.wait(10), "test did not release publication"
+
+    monkeypatch.setattr(distributions, "_revalidate_plan", pause_after_revalidation)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(publish)
+        try:
+            assert planned.wait(10), "publication did not reach revalidation"
+            staged = plans[0].staged_dir
+            root_inode = staged.stat().st_ino
+            external = tmp_path / "private"
+            if change == "staged_dir_link":
+                external.mkdir()
+                (external / "guide.md").write_text("SECRET outside distribution")
+                shutil.rmtree(staged / "skills")
+                (staged / "skills").symlink_to(external, target_is_directory=True)
+            elif change == "staged_file_link":
+                external.write_text("SECRET outside distribution")
+                (staged / "SOUL.md").unlink()
+                (staged / "SOUL.md").symlink_to(external)
+            elif change == "staged_file_replace":
+                external.write_text("Unapproved replacement")
+                external.replace(staged / "SOUL.md")
+            else:
+                (staged / "SOUL.md").write_text("Unapproved overwrite")
+            assert staged.stat().st_ino == root_inode
+            if change in {"staged_file_link", "staged_dir_link"}:
+                private_file = external / "guide.md" if change == "staged_dir_link" else external
+                private_reads = _observe_private_reads(private_file, monkeypatch)
+        finally:
+            release.set()
+        try:
+            pending.result(timeout=10)
+        except DistributionError:
+            pass
+    assert not private_reads
+    assert (target / "SOUL.md").read_text() == "Updated distribution content"
+    assert (target / "skills" / "guide.md").read_text() == "Planned skill content"
+    assert not plans[0].staged_dir.exists()
+
+
 @pytest.mark.parametrize("finish,change", [("rename", None), ("delete", None), ("retry_delete", None),
     ("install", "confirm_local"), ("install", "confirm_git"), ("install", "bootstrap_link"),
 ] + [
@@ -707,52 +758,7 @@ def test_legacy_main_profile_remains_manageable(profile_home, tmp_path, monkeypa
         }
 
         if change.startswith("staged_"):
-            plans = []
-            private_reads = []
-            revalidate = distributions._revalidate_plan
-
-            def pause_after_revalidation(plan):
-                revalidate(plan)
-                plans.append(plan)
-                planned.set()
-                assert release.wait(10), "test did not release publication"
-
-            monkeypatch.setattr(distributions, "_revalidate_plan", pause_after_revalidation)
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                pending = pool.submit(publish[finish])
-                try:
-                    assert planned.wait(10), "publication did not reach revalidation"
-                    staged = plans[0].staged_dir
-                    root_inode = staged.stat().st_ino
-                    external = tmp_path / "private"
-                    if change == "staged_dir_link":
-                        external.mkdir()
-                        (external / "guide.md").write_text("SECRET outside distribution")
-                        shutil.rmtree(staged / "skills")
-                        (staged / "skills").symlink_to(external, target_is_directory=True)
-                    elif change == "staged_file_link":
-                        external.write_text("SECRET outside distribution")
-                        (staged / "SOUL.md").unlink()
-                        (staged / "SOUL.md").symlink_to(external)
-                    elif change == "staged_file_replace":
-                        external.write_text("Unapproved replacement")
-                        external.replace(staged / "SOUL.md")
-                    else:
-                        (staged / "SOUL.md").write_text("Unapproved overwrite")
-                    assert staged.stat().st_ino == root_inode
-                    if change in {"staged_file_link", "staged_dir_link"}:
-                        private_file = external / "guide.md" if change == "staged_dir_link" else external
-                        private_reads = _observe_private_reads(private_file, monkeypatch)
-                finally:
-                    release.set()
-                try:
-                    pending.result(timeout=10)
-                except DistributionError:
-                    pass
-            assert not private_reads
-            assert (target / "SOUL.md").read_text() == "Updated distribution content"
-            assert (target / "skills" / "guide.md").read_text() == "Planned skill content"
-            assert not plans[0].staged_dir.exists()
+            _assert_staged_publication(target, tmp_path, monkeypatch, publish[finish], change)
             return
 
         if change.startswith("publication_"):
