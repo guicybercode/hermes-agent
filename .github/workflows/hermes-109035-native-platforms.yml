@@ -1,0 +1,131 @@
+name: Quit confirmation native platforms
+
+on:
+  push:
+    branches: ['validation/109035-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quit-confirmation-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-quit:
+    if: github.event.repository.fork == true
+    name: Native quit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+      NODE_OPTIONS: --max-old-space-size=6144
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Record and verify source revision
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process'
+          import { mkdirSync, writeFileSync } from 'node:fs'
+          const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim()
+          const changed = git('diff', '--name-only', 'HEAD^', 'HEAD').split('\n')
+          const receipt = {
+            validationCommit: git('rev-parse', 'HEAD'),
+            featureCommit: git('rev-parse', 'HEAD^'),
+            changedFiles: changed,
+            platform: process.platform,
+            arch: process.arch,
+            node: process.version,
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT
+          }
+          mkdirSync('native-platform-evidence', { recursive: true })
+          writeFileSync('native-platform-evidence/revision.json', JSON.stringify(receipt, null, 2))
+          console.log(JSON.stringify(receipt, null, 2))
+          if (changed.length !== 1 || changed[0] !== '.github/workflows/hermes-109035-native-platforms.yml') {
+            throw new Error('Validation HEAD must add only this workflow on top of the exact feature commit')
+          }
+          NODE
+
+      - name: Install pinned npm
+        run: |
+          npm install --global npm@11.17.0 --no-audit --no-fund
+          node --version
+          npm --version
+
+      - name: Install Linux Electron dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+
+      - name: Install desktop workspace dependencies
+        run: npm ci --workspace apps/desktop --include-workspace-root --no-audit --no-fund
+
+      - name: Build desktop
+        id: build
+        run: npm run build --workspace apps/desktop
+
+      - name: Exercise native quit lifecycle
+        id: test
+        working-directory: apps/desktop
+        run: |
+          if [ "$RUNNER_OS" = 'Linux' ]; then
+            xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+              npx --no-install playwright test e2e/quit-confirmation.spec.ts --workers=1 --retries=0
+          else
+            npx --no-install playwright test e2e/quit-confirmation.spec.ts --workers=1 --retries=0
+          fi
+
+      - name: Record validation outcome
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { mkdirSync, writeFileSync } from 'node:fs'
+          const receipt = {
+            platform: process.platform,
+            node: process.version,
+            build: process.env.BUILD_OUTCOME,
+            test: process.env.TEST_OUTCOME,
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT
+          }
+          mkdirSync('native-platform-evidence', { recursive: true })
+          writeFileSync('native-platform-evidence/outcome.json', JSON.stringify(receipt, null, 2))
+          console.log(JSON.stringify(receipt, null, 2))
+          NODE
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quit-confirmation-${{ matrix.os }}-${{ github.sha }}
+          retention-days: 14
+          path: |
+            native-platform-evidence/
+            apps/desktop/playwright-report/
+            apps/desktop/test-results/
