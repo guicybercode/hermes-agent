@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from hermes_cli.profile_distribution_source_windows import open_source
+from hermes_cli.profile_distribution_source_windows import _Source, _checked_stat, _filesystem_path
 
 
 @contextmanager
@@ -18,6 +19,40 @@ def _native_errors(path: Path):
         yield
     except pywintypes.error as exc:
         raise OSError(exc.winerror, exc.strerror, str(path)) from exc
+
+
+@contextmanager
+def _open_directory_handle(path: Path):
+    import win32file
+
+    with _native_errors(path):
+        expected = _checked_stat(path)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"Distribution destination parent is not a directory: {path}")
+        # Read access makes the no-delete sharing rule protect the directory.
+        # Write sharing permits child publication; source readers stay stricter.
+        handle = win32file.CreateFile(
+            str(path), win32file.GENERIC_READ,
+            win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE, None,
+            win32file.OPEN_EXISTING,
+            win32file.FILE_FLAG_OPEN_REPARSE_POINT | win32file.FILE_FLAG_BACKUP_SEMANTICS, None,
+        )
+        try:
+            source = _Source(path, handle, expected, win32file)
+            yield source
+            source._verify()
+        finally:
+            win32file.CloseHandle(handle)
+
+
+@contextmanager
+def _directory_chain(path: Path):
+    with ExitStack() as parents:
+        source = parents.enter_context(_open_directory_handle(Path(path.anchor)))
+        for name in path.parts[1:]:
+            source._verify()
+            source = parents.enter_context(_open_directory_handle(source._path / name))
+        yield source
 
 
 class DirAnchor:
@@ -45,7 +80,8 @@ class DirAnchor:
         # child() retains its parent. Never enumerate it: sibling publications may
         # change directory contents while identity and ancestry remain protected.
         with _native_errors(path):
-            manager = self._source.child(name)
+            self.verify()
+            manager = _open_directory_handle(path)
             source = manager.__enter__()
             if not source.is_dir:
                 manager.__exit__(None, None, None)
@@ -76,7 +112,9 @@ class DirAnchor:
             # Pin the leaf as well while changing attributes. A replacement link
             # must never redirect this cleanup write outside the private backup.
             handle = win32file.CreateFile(
-                str(path), 0, win32file.FILE_SHARE_READ, None, win32file.OPEN_EXISTING,
+                str(path), win32file.GENERIC_READ,
+                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE, None,
+                win32file.OPEN_EXISTING,
                 win32file.FILE_FLAG_OPEN_REPARSE_POINT | win32file.FILE_FLAG_BACKUP_SEMANTICS, None,
             )
             try:
@@ -144,7 +182,9 @@ def open_directory(path: Path) -> DirAnchor:
     Reuse the source reader's reparse, identity, UNC and short-name handling.
     Directory content checks remain disabled because no names() call is made.
     """
-    manager = open_source(path)
+    if sys.platform != "win32":
+        raise OSError("Native Windows distribution destinations require Windows")
+    manager = _directory_chain(_filesystem_path(path))
     source = manager.__enter__()
     if not source.is_dir:
         manager.__exit__(None, None, None)
