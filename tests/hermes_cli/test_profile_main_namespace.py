@@ -407,6 +407,89 @@ def _observe_private_reads(private_file, monkeypatch):
     return observed
 
 
+def _profile_tree_contents(root):
+    contents = {}
+    for entry in root.rglob("*"):
+        mode = entry.lstat().st_mode
+        if entry.is_symlink():
+            value = entry.readlink()
+        elif entry.is_file():
+            value = entry.read_bytes()
+        else:
+            value = None
+        contents[entry.relative_to(root)] = (mode, value)
+    return contents
+
+
+def _assert_publication_transaction(source, target, monkeypatch, finish, change):
+    (target / "later.md").write_text("Previously installed later entry")
+    (target / "skills" / "empty").mkdir()
+    (target / ".env").write_text("USER_SECRET=preserved\n")
+    (source / "SOUL.md").write_text("New first entry")
+    (source / "later.md").write_text("New later entry")
+    (source / "skills" / "guide.md").write_text("New directory payload")
+    (source / "skills" / "new-empty").mkdir()
+    (source / "new" / "parents").mkdir(parents=True)
+    (source / "new" / "parents" / "new.md").write_text("New nested entry")
+    manifest_name = distributions.MANIFEST_FILENAME
+    new_file = "new/parents/new.md"
+    ordered = {
+        "transaction_late_second": ["SOUL.md", "later.md", "skills", new_file, manifest_name],
+        "transaction_late_third": ["SOUL.md", "skills", "later.md", new_file, manifest_name],
+        "transaction_commit_first": ["SOUL.md", new_file, "skills", "later.md", manifest_name],
+        "transaction_commit_second": [new_file, "skills", "SOUL.md", "later.md", manifest_name],
+        "transaction_commit_manifest": [manifest_name, "SOUL.md", new_file, "skills", "later.md"],
+    }[change]
+    write_manifest(source, DistributionManifest(
+        name="main", source=str(source), version="2.0.0", distribution_owned=ordered,
+    ))
+    before = _profile_tree_contents(target)
+    parent_entries = set(target.parent.iterdir())
+    identity = target.stat().st_dev, target.stat().st_ino
+    stages = []
+    real_plan = distributions.plan_install
+
+    def capture_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        stages.append(plan.staged_dir)
+        if change.startswith("transaction_late_"):
+            (plan.staged_dir / "later.md").write_text("Changed after approval")
+        return plan
+
+    monkeypatch.setattr(distributions, "plan_install", capture_plan)
+    applied, failed = [], []
+    if change.startswith("transaction_commit_"):
+        fail_after = 1 if change == "transaction_commit_first" else 2
+        real_replace = os.replace
+        destinations = {target.joinpath(*Path(relative).parts) for relative in ordered}
+
+        def fail_next_publication(src, dst, *args, **kwargs):
+            destination = Path(dst)
+            publishes_owned_entry = destination in destinations
+            if publishes_owned_entry and len(applied) == fail_after and not failed:
+                failed.append(destination)
+                raise OSError("injected one-time publication failure")
+            result = real_replace(src, dst, *args, **kwargs)
+            if publishes_owned_entry:
+                applied.append(destination)
+            return result
+
+        monkeypatch.setattr(os, "replace", fail_next_publication)
+
+    with pytest.raises(DistributionError):
+        if finish == "install":
+            install_distribution(str(source), name="main", force=True)
+        else:
+            update_distribution("main")
+    if change.startswith("transaction_commit_"):
+        assert len(failed) == 1
+        assert len(applied) >= fail_after
+    assert (target.stat().st_dev, target.stat().st_ino) == identity
+    assert _profile_tree_contents(target) == before
+    assert set(target.parent.iterdir()) == parent_entries
+    assert stages and all(not staged.exists() for staged in stages)
+
+
 @pytest.mark.parametrize("finish,change", [("rename", None), ("delete", None), ("retry_delete", None),
     ("install", "confirm_local"), ("install", "confirm_git"),
 ] + [
@@ -417,6 +500,8 @@ def _observe_private_reads(private_file, monkeypatch):
         "source_file", "source_file_link", "source_dir_link",
         "publication_rename", "publication_delete",
         "staged_file_link", "staged_dir_link", "staged_file_replace", "staged_file_write",
+        "transaction_late_second", "transaction_late_third",
+        "transaction_commit_first", "transaction_commit_second", "transaction_commit_manifest",
     )
 ] + [
     pytest.param(operation, "directory_modes", marks=marker, id=f"{operation}-directory_modes-{host}")
@@ -464,6 +549,9 @@ def test_legacy_main_profile_remains_manageable(profile_home, tmp_path, monkeypa
         return
     if change == "directory_modes":
         _assert_directory_modes(source, legacy, monkeypatch, finish)
+        return
+    if change is not None and change.startswith("transaction_"):
+        _assert_publication_transaction(source, legacy, monkeypatch, finish, change)
         return
 
     if change is not None:
