@@ -41,7 +41,7 @@ def profile_home(tmp_path, monkeypatch):
 @pytest.mark.parametrize("operation", [
     "create", "import", "rename", "distribution", "distribution_tombstone", "distribution_symlink",
     "stage_inside_source", "stage_inside_target",
-    "stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission",
+    "stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission", "stage_manifest", "stage_existing",
 ])
 @pytest.mark.parametrize("name", ["main", "MAIN", " main "])
 def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_path, monkeypatch, operation, name):
@@ -54,7 +54,21 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
         bundle.add(source, arcname="source")
     write_manifest(source, DistributionManifest(name="source"))
     target = profile_home / "profiles" / "main"
-    if operation in {"stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission"}:
+    if operation == "stage_existing":
+        target.mkdir()
+        (target / "config.yaml").write_text(config)
+        workdir = tmp_path / "staging"
+        previous = workdir / "local"
+        previous.mkdir(parents=True)
+        (previous / "keep.md").write_text("Caller-owned tree")
+        with pytest.raises(DistributionError):
+            distributions.plan_install(str(source), workdir, override_name=name)
+        assert list(previous.iterdir()) == [previous / "keep.md"]
+        assert (previous / "keep.md").read_text() == "Caller-owned tree"
+        assert (target / "config.yaml").read_text() == config
+        return
+
+    if operation in {"stage_file_link", "stage_dir_link", "stage_disappears", "stage_permission", "stage_manifest"}:
         (source / "SOUL.md").write_text("Planned source content")
         (source / "skills").mkdir()
         (source / "skills" / "guide.md").write_text("Planned skill content")
@@ -80,6 +94,9 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
                 raise PermissionError("source permission changed during staging")
             if operation == "stage_disappears":
                 (source / "SOUL.md").unlink()
+                return
+            if operation == "stage_manifest":
+                write_manifest(source, DistributionManifest(name="other", version="9.9.9"))
                 return
             if operation == "stage_dir_link":
                 shutil.rmtree(source / "skills")
@@ -112,9 +129,10 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
         else:
             (target / "config.yaml").write_text(config)
             (parent / "guide.md").write_text("Existing skill content")
+            write_manifest(source, DistributionManifest(name=name))
 
         with pytest.raises(DistributionError, match="outside"):
-            distributions.plan_install(str(source), workdir, override_name=name)
+            distributions.plan_install(str(source), workdir)
         assert (source / "config.yaml").read_text() == config
         if operation == "stage_inside_source":
             assert not list(workdir.iterdir())
@@ -129,22 +147,15 @@ def test_new_profile_targets_cannot_claim_default_namespace(profile_home, tmp_pa
         external = tmp_path / "private.md"
         external.write_text("Not distribution content")
         (source / "SOUL.md").symlink_to(external)
-        staged = []
-        real_reject = distributions._reject_distribution_symlinks
-
-        def inspect_staged(path):
-            staged.append((path, (path / "SOUL.md").is_symlink()))
-            real_reject(path)
-
-        monkeypatch.setattr(distributions, "_reject_distribution_symlinks", inspect_staged)
+        target.mkdir()
+        (target / "config.yaml").write_text(config)
+        workdir = tmp_path / "staging"
         with pytest.raises(DistributionError, match="symlink"):
-            install_distribution(str(source), name=name)
-        assert staged and staged[0][1]
-        assert not staged[0][0].is_relative_to(source)
-        assert not staged[0][0].is_relative_to(target)
-        assert not staged[0][0].exists()
+            distributions.plan_install(str(source), workdir, override_name=name)
+        assert not (workdir / "local").exists()
         assert external.read_text() == "Not distribution content"
-        assert not target.exists()
+        assert (target / "config.yaml").read_text() == config
+        assert not (target / "SOUL.md").exists()
         return
 
     tombstoned = operation == "distribution_tombstone"
