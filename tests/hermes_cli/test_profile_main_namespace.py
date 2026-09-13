@@ -340,8 +340,9 @@ def _assert_windows_source_contract(tmp_path, monkeypatch, change):
         exported = Path(workspace) / "distribution"
         shutil.copytree(source, exported)
         raw = str(exported)
-        if change == "windows_extended_unc":
+        if change in {"windows_unc", "windows_extended_unc"}:
             assert raw.startswith("\\\\")
+        if change == "windows_extended_unc":
             raw = "\\\\?\\UNC\\" + raw[2:]
         elif change == "windows_extended_path":
             raw = "\\\\?\\" + raw
@@ -353,8 +354,6 @@ def _assert_windows_source_contract(tmp_path, monkeypatch, change):
                 pytest.skip("The source volume must provide 8.3 aliases for native short-path coverage")
             assert Path(short_path).samefile(exported)
             raw = short_path
-        elif change == "windows_unc":
-            assert raw.startswith("\\\\")
         with open_source(Path(raw)) as captured:
             for name, expected in (("SOUL.md", payload), ("empty.md", b"")):
                 with captured.child(name) as entry:
