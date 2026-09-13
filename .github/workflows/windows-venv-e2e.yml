@@ -99,6 +99,15 @@ jobs:
                   win32file.CloseHandle(handle)
           PY
 
+      - name: Probe native directory handle modes
+        shell: bash
+        run: |
+          set +e
+          scripts/run_tests.sh tests/hermes_cli/test_destination_handle_probe.py -j 1 --file-retries 0 --tb=short
+          probe_status=$?
+          cat tests/hermes_cli/test_destination_handle_probe.json
+          exit "$probe_status"
+
       - name: Run profile distribution regression suites
         shell: bash
         run: |
