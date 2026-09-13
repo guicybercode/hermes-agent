@@ -1,0 +1,15 @@
+{
+  "platform": "darwin",
+  "appPid": 22027,
+  "backendPid": 22424,
+  "healthBeforeQuit": 200,
+  "healthWhilePromptPending": 200,
+  "healthAfterCancel": 200,
+  "sameBackendIdentityAfterCancel": true,
+  "backendExitedAfterAcceptance": true,
+  "ownershipReleasedAfterAcceptance": true,
+  "nativeDialogs": 2,
+  "featureCommit": "293f3f75d841b3faa25efa0b65a8e4e5ee7c5474",
+  "capturedAt": "2026-09-13T05:46:22.208490+00:00",
+  "validation": "One-off Playwright rehearsal against the built app and a real isolated hermes serve backend; no model call."
+}
