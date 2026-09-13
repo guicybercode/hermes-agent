@@ -243,6 +243,11 @@ def _assert_confirmation_snapshot(source, legacy, tmp_path, monkeypatch, change)
 
 
 def _assert_directory_modes(source, legacy, monkeypatch, finish):
+    manifest = distributions.read_manifest(source)
+    manifest.distribution_owned = ["SOUL.md", "skills"]
+    write_manifest(source, manifest)
+    manifest_mode = 0o600 if finish == "install" else 0o640
+    (legacy / distributions.MANIFEST_FILENAME).chmod(manifest_mode)
     (source / "skills" / "empty").mkdir()
     (source / "skills" / "readonly").mkdir()
     (source / "skills" / "readonly" / "guide.md").write_text("Readable in an immutable directory")
@@ -266,6 +271,7 @@ def _assert_directory_modes(source, legacy, monkeypatch, finish):
     assert stages == [expected_modes]
     assert {relative: stat.S_IMODE((legacy / relative).stat().st_mode)
             for relative in expected_modes} == expected_modes
+    assert stat.S_IMODE((legacy / distributions.MANIFEST_FILENAME).stat().st_mode) == manifest_mode
     assert not list((legacy / "skills" / "empty").iterdir())
     assert not installed.staged_dir.exists()
 
@@ -439,6 +445,7 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         "transaction_commit_first": ["SOUL.md", new_file, "skills", "later.md", manifest_name],
         "transaction_commit_second": [new_file, "skills", "SOUL.md", "later.md", manifest_name],
         "transaction_commit_manifest": [manifest_name, "SOUL.md", new_file, "skills", "later.md"],
+        "transaction_commit_rollback_failure": ["SOUL.md", "skills", "later.md", new_file, manifest_name],
     }[change]
     write_manifest(source, DistributionManifest(
         name="main", source=str(source), version="2.0.0", distribution_owned=ordered,
@@ -457,26 +464,36 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         return plan
 
     monkeypatch.setattr(distributions, "plan_install", capture_plan)
-    applied, failed = [], []
+    applied, failed, rollback_failed = [], [], []
+    backups = {}
     if change.startswith("transaction_commit_"):
         fail_after = 1 if change == "transaction_commit_first" else 2
         real_replace = os.replace
         destinations = {target.joinpath(*Path(relative).parts) for relative in ordered}
 
         def fail_next_publication(src, dst, *args, **kwargs):
+            origin = Path(src)
             destination = Path(dst)
             publishes_owned_entry = destination in destinations
+            if (
+                change == "transaction_commit_rollback_failure" and failed and not rollback_failed
+                and destination == target / "skills" and origin == backups.get(destination)
+            ):
+                rollback_failed.append(origin)
+                raise OSError("injected one-time restore failure")
             if publishes_owned_entry and len(applied) == fail_after and not failed:
                 failed.append(destination)
                 raise OSError("injected one-time publication failure")
             result = real_replace(src, dst, *args, **kwargs)
+            if origin in destinations and not publishes_owned_entry and not failed:
+                backups[origin] = destination
             if publishes_owned_entry:
                 applied.append(destination)
             return result
 
         monkeypatch.setattr(os, "replace", fail_next_publication)
 
-    with pytest.raises(DistributionError):
+    with pytest.raises(DistributionError) as error:
         if finish == "install":
             install_distribution(str(source), name="main", force=True)
         else:
@@ -485,13 +502,28 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         assert len(failed) == 1
         assert len(applied) >= fail_after
     assert (target.stat().st_dev, target.stat().st_ino) == identity
+    if change == "transaction_commit_rollback_failure":
+        assert rollback_failed == [backups[target / "skills"]]
+        retained = rollback_failed[0]
+        backup_root = retained.parent
+        assert retained.name == "skills" and retained.is_dir()
+        assert str(backup_root) in str(error.value)
+        assert set(target.parent.iterdir()) == parent_entries | {backup_root}
+        recovered = _profile_tree_contents(target)
+        recovered[Path("skills")] = (retained.lstat().st_mode, None)
+        recovered.update({Path("skills") / path: value for path, value in _profile_tree_contents(retained).items()})
+        assert recovered == before
+        assert not (backup_root / "SOUL.md").exists()
+        assert not (backup_root / "later.md").exists()
+        assert stages and all(not staged.exists() for staged in stages)
+        return
     assert _profile_tree_contents(target) == before
     assert set(target.parent.iterdir()) == parent_entries
     assert stages and all(not staged.exists() for staged in stages)
 
 
 @pytest.mark.parametrize("finish,change", [("rename", None), ("delete", None), ("retry_delete", None),
-    ("install", "confirm_local"), ("install", "confirm_git"),
+    ("install", "confirm_local"), ("install", "confirm_git"), ("install", "bootstrap_link"),
 ] + [
     (operation, change)
     for operation in ("install", "update")
@@ -502,6 +534,7 @@ def _assert_publication_transaction(source, target, monkeypatch, finish, change)
         "staged_file_link", "staged_dir_link", "staged_file_replace", "staged_file_write",
         "transaction_late_second", "transaction_late_third",
         "transaction_commit_first", "transaction_commit_second", "transaction_commit_manifest",
+        "transaction_commit_rollback_failure",
     )
 ] + [
     pytest.param(operation, "directory_modes", marks=marker, id=f"{operation}-directory_modes-{host}")
@@ -543,6 +576,22 @@ def test_legacy_main_profile_remains_manageable(profile_home, tmp_path, monkeypa
     assert updated.target_dir == legacy
     assert (legacy / "SOUL.md").read_text() == (source / "SOUL.md").read_text()
     assert (legacy / "config.yaml").read_text() == config
+
+    if change == "bootstrap_link":
+        private = tmp_path / "private-sessions"
+        private.mkdir()
+        (private / "session.json").write_text('{"private": "preserved"}')
+        linked = legacy / "sessions"
+        linked.symlink_to(private, target_is_directory=True)
+        link_identity = linked.lstat().st_ino, linked.readlink()
+        private_contents = _profile_tree_contents(private)
+        (source / "SOUL.md").write_text("Installed while personal sessions stay linked")
+        installed = install_distribution(str(source), name="main", force=True)
+        assert installed.target_dir == legacy
+        assert (legacy / "SOUL.md").read_bytes() == (source / "SOUL.md").read_bytes()
+        assert linked.is_symlink() and (linked.lstat().st_ino, linked.readlink()) == link_identity
+        assert _profile_tree_contents(private) == private_contents
+        return
 
     if change in {"confirm_local", "confirm_git"}:
         _assert_confirmation_snapshot(source, legacy, tmp_path, monkeypatch, change)
